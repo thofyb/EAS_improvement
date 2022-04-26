@@ -7194,7 +7194,7 @@ static int start_cpu(struct task_struct *p, bool prefer_idle,
 }
 
 static inline int find_best_target(struct task_struct *p, int *backup_cpu,
-				   bool boosted, bool prefer_idle)
+				   bool boosted, bool prefer_idle, bool *wake_flag)
 {
 	unsigned long best_idle_min_cap_orig = ULONG_MAX;
 	unsigned long min_util = boosted_task_util(p);
@@ -7215,6 +7215,18 @@ static inline int find_best_target(struct task_struct *p, int *backup_cpu,
 	int cap_min;
 	int prev_cpu = task_cpu(p);
 	bool turning = false;
+	unsigned long target_min_capped_util = ULONG_MAX;
+    const struct sched_group_energy *sge;
+    int min_cap_orig_cpu;
+    int cap_idx, cap;
+    unsigned long new_capacity;
+    int active_cpu_counter;
+    unsigned long dyn_pwr;
+    int max_curr_util;
+    int pid = p->pid;
+    int idx;
+    unsigned long util, util_sum;
+    int rise_energy_cost, wake_energy_cost;
 
 #ifdef CONFIG_CGROUP_SCHEDTUNE
 	cap_min = schedtune_task_capacity_min(p);
@@ -7362,6 +7374,7 @@ static inline int find_best_target(struct task_struct *p, int *backup_cpu,
 			target_capacity = capacity_orig;
 			target_util = new_util;
 			target_cpu = i;
+			target_min_capped_util = min_capped_util;
 		}
 
 	} while (sg = sg->next, sg != sd->groups);
@@ -7370,6 +7383,113 @@ static inline int find_best_target(struct task_struct *p, int *backup_cpu,
 		target_capacity <= best_idle_min_cap_orig) {
 		target_cpu = best_idle_cpu;
 	}
+
+	if (!turning) {
+        min_cap_orig_cpu = cpu_rq(smp_processor_id())->rd->min_cap_orig_cpu;
+        if (target_cpu != -1 && target_capacity == min_cap_orig_cpu &&
+                    best_idle_cpu != -1 &&
+                    best_idle_min_cap_orig == min_cap_orig_cpu) {
+            if (capacity_curr_of(target_cpu) < target_min_capped_util) {
+                target_util = cpu_util_wake(target_cpu, p);
+                target_util += task_util(p);
+                sd = rcu_dereference(per_cpu(sd_ea, target_cpu));
+                sg = sd->groups;
+                sge = cpu_core_energy(target_cpu);
+                new_capacity = target_util * capacity_margin_dvfs >> SCHED_CAPACITY_SHIFT;
+                new_capacity = min(new_capacity,
+		            (unsigned long) sge->cap_states[sge->nr_cap_states-1].cap);
+
+                for (idx = 0; idx < sge->nr_cap_states; idx++) {
+                    if (sge->cap_states[idx].cap >= new_capacity) {
+                        cap_idx = idx;
+                        cap = sge->cap_states[idx].cap;
+                        break;
+                    }
+                }
+
+                active_cpu_counter = 0;
+                for_each_cpu(i, sched_group_cpus(sg)) {
+                    if (idle_cpu(i)) {
+                        continue;
+                    }
+
+                    if (!cpu_online(i))
+				        continue;
+
+                    util = i == target_cpu
+                            ? target_util
+                            : cpu_util_wake(cpu, p);
+
+                    util_sum += __cpu_norm_util(util, cap);
+                    active_cpu_counter++;
+                }
+                dyn_pwr = sge->cap_states[cap_idx].dyn_pwr;
+                rise_energy_cost = util_sum * dyn_pwr * active_cpu_counter;
+
+                sd = rcu_dereference(per_cpu(sd_ea, best_idle_cpu));
+                sg = sd->groups;
+                sge = cpu_core_energy(best_idle_cpu);
+                max_curr_util = task_util(p);
+
+                for_each_cpu(i, sched_group_cpus(sg)) {
+                    if (idle_cpu(i)) {
+                        continue;
+                    }
+
+                    if (!cpu_online(i))
+				        continue;
+
+                    util = cpu_util_wake(cpu, p);
+                    if (util > max_curr_util) {
+                        max_curr_util = util;
+                    }
+                }
+
+                new_capacity = max_curr_util * capacity_margin_dvfs >> SCHED_CAPACITY_SHIFT;
+                new_capacity = min(new_capacity,
+		            (unsigned long) sge->cap_states[sge->nr_cap_states-1].cap);
+
+                for (idx = 0; idx < sge->nr_cap_states; idx++) {
+                    if (sge->cap_states[idx].cap >= new_capacity) {
+                        cap_idx = idx;
+                        cap = sge->cap_states[idx].cap;
+                        break;
+                    }
+                }
+
+                active_cpu_counter = 0;
+                for_each_cpu(i, sched_group_cpus(sg)) {
+                    if (idle_cpu(i)) {
+                        continue;
+                    }
+
+                    if (!cpu_online(i))
+				        continue;
+
+                    util = cpu_util_wake(cpu,p);
+
+                    util_sum += __cpu_norm_util(util, cap);
+                    active_cpu_counter++;
+                }
+                util_sum += __cpu_norm_util(task_util(p), cap);
+                active_cpu_counter++;
+
+                dyn_pwr = sge->cap_states[cap_idx].dyn_pwr;
+                wake_energy_cost = util_sum * dyn_pwr * active_cpu_counter;
+
+                if (wake_energy_cost < rise_energy_cost) {
+                    *backup_cpu = target_cpu;
+                    target_cpu = best_idle_cpu;
+                    *wake_flag = true;
+                } else {
+                    *backup_cpu = best_idle_cpu;
+                }
+                goto target_selected;
+            }
+        }
+        if (target_capacity > best_idle_min_cap_orig)
+    		target_cpu = best_idle_cpu;
+    }
 
 	if (target_cpu == -1)
 		target_cpu = prefer_idle
@@ -7380,6 +7500,7 @@ static inline int find_best_target(struct task_struct *p, int *backup_cpu,
 		? best_active_cpu
 		: best_idle_cpu;
 
+target_selected:
 	trace_sched_find_best_target(p, prefer_idle, min_util, cpu,
 				     best_idle_cpu, best_active_cpu,
 				     target_cpu);
@@ -7420,6 +7541,7 @@ static int select_energy_cpu_brute(struct task_struct *p, int prev_cpu, int sync
 	int backup_cpu;
 	int next_cpu;
 	unsigned int task_clamped_util;
+	bool wake_flag = false;
 
 	schedstat_inc(p->se.statistics.nr_wakeups_secb_attempts);
 	schedstat_inc(this_rq()->eas_stats.secb_attempts);
@@ -7454,7 +7576,7 @@ static int select_energy_cpu_brute(struct task_struct *p, int prev_cpu, int sync
 	sync_entity_load_avg(&p->se);
 
 	/* Find a cpu with sufficient capacity */
-	next_cpu = find_best_target(p, &backup_cpu, boosted, prefer_idle);
+	next_cpu = find_best_target(p, &backup_cpu, boosted, prefer_idle, &wake_flag);
 	if (next_cpu == -1) {
 		target_cpu = prev_cpu;
 		goto unlock;
@@ -7541,6 +7663,13 @@ static int select_energy_cpu_brute(struct task_struct *p, int prev_cpu, int sync
 			target_cpu = next_cpu;
 			goto unlock;
 		}
+		
+		if (wake_flag) {
+            schedstat_inc(p->se.statistics.nr_wakeups_secb_nrg_sav);
+			schedstat_inc(this_rq()->eas_stats.secb_nrg_sav);
+			target_cpu = next_cpu;
+			goto unlock;
+        }
 
 		/* Check if EAS_CPU_NXT is a more energy efficient CPU */
 		if (select_energy_cpu_idx(&eenv) != EAS_CPU_PRV) {
